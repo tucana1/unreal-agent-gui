@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Unreal Agent</string>
+	<key>CFBundleDisplayName</key>
+	<string>Unreal Agent</string>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.tucana1.unreal-agent-gui</string>
+	<key>CFBundleExecutable</key>
+	<string>unreal-agent-gui</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>LSEnvironment</key>
+	<dict>
+		<!-- Finder launches get a minimal PATH; load the login shell's environment. -->
+		<key>UAG_LOGIN_ENV</key>
+		<string>1</string>
+	</dict>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- The window talks to the app's own loopback API. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+</dict>
+</plist>

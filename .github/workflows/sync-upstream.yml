@@ -1,0 +1,71 @@
+name: Sync upstream
+
+# Merges unreallabsai/unreal-agent into main when the GUI still builds and
+# passes its tests against it; otherwise opens an issue and leaves main alone.
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: macos-15
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Merge upstream
+        id: merge
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/unreallabsai/unreal-agent.git
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          git log --oneline HEAD..upstream/main | tee "$RUNNER_TEMP/upstream-commits.txt"
+          git merge --no-edit upstream/main
+      - name: Build and test the GUI against upstream
+        if: steps.merge.outputs.changed == 'true'
+        working-directory: gui
+        run: |
+          go mod tidy
+          make check test build
+      - name: Push
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          git add gui/go.mod gui/go.sum
+          git diff --cached --quiet || git commit -m 'gui: go mod tidy after upstream sync'
+          git push origin HEAD:main
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title='Upstream sync needs attention'
+          existing=$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number')
+          body=$(printf 'Merging upstream or building the GUI against it failed: %s\n\nNew upstream commits:\n```\n%s\n```\n\nMerge manually: `git fetch upstream && git merge upstream/main`, then `cd gui && go mod tidy && make test`.' "$RUN_URL" "$(cat "$RUNNER_TEMP/upstream-commits.txt" 2>/dev/null)")
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

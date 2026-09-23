@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Unreal Agent</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%236d5dfc'/%3E%3Cpath d='M4 4v5a4 4 0 0 0 8 0V4' stroke='white' stroke-width='2' fill='none'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <button id="new-chat" class="primary wide">New chat</button>
+    <div class="workspace-row">
+      <span class="label">Workspace for new chats</span>
+      <button id="ws-change" class="link" title="Change workspace"></button>
+    </div>
+    <nav id="sessions"></nav>
+    <footer class="side-foot">
+      <button id="open-settings" class="wide">Settings</button>
+      <div id="gh-status" class="muted small"></div>
+    </footer>
+  </aside>
+
+  <main id="chat">
+    <header id="toolbar">
+      <button id="toggle-side" class="icon" title="Toggle sidebar">☰</button>
+      <div id="title" class="grow"><span id="title-text"></span><span id="title-ws" class="muted small"></span></div>
+      <select id="provider" title="Provider"></select>
+      <input id="model" list="model-list" placeholder="model" spellcheck="false" autocomplete="off" title="Model">
+      <datalist id="model-list"></datalist>
+      <select id="thinking" title="Thinking level"></select>
+      <label class="toggle" id="websearch-label"><input type="checkbox" id="websearch"> Web</label>
+      <button id="toggle-files" class="icon" title="Toggle files panel">▤</button>
+    </header>
+
+    <div id="scroll">
+      <div id="log"></div>
+      <div id="empty" hidden>
+        <h1>What should the agent work on?</h1>
+        <p class="muted">It can search the web, read PDFs and Office files, look at images, run code, and work with GitHub — all inside your workspace. Messages sent while it works steer the run in progress.</p>
+      </div>
+      <div id="working" hidden><span class="spinner"></span> Working…</div>
+    </div>
+
+    <div id="banner" hidden><span id="banner-text"></span><button id="banner-retry" hidden>Retry</button><button id="banner-close" class="icon" title="Dismiss">×</button></div>
+
+    <form id="composer" autocomplete="off">
+      <div id="attachments"></div>
+      <div class="composer-row">
+        <button type="button" id="attach" class="icon" title="Attach files">＋</button>
+        <input type="file" id="file-input" multiple hidden>
+        <textarea id="input" rows="1" placeholder="Message the agent — Enter to send, Shift+Enter for a new line. Paste or drop files."></textarea>
+        <button type="submit" id="send" class="primary">Send</button>
+        <button type="button" id="stop" class="danger" hidden title="Stop the agent (press twice to force)">Stop</button>
+      </div>
+      <div id="usage" class="muted small"></div>
+    </form>
+  </main>
+
+  <aside id="files">
+    <header class="panel-head">
+      <button id="files-up" class="icon" title="Up one folder">↑</button>
+      <span id="files-path" class="grow ellipsis"></span>
+      <button id="files-reveal" class="icon" title="Show in file manager">⤴</button>
+      <button id="files-refresh" class="icon" title="Refresh">↻</button>
+    </header>
+    <div id="file-list"></div>
+    <section id="preview" hidden>
+      <header class="panel-head">
+        <span id="preview-name" class="grow ellipsis"></span>
+        <a id="preview-download" class="icon" title="Download">⤓</a>
+        <button id="preview-open" class="icon" title="Open in default app">⧉</button>
+        <button id="preview-close" class="icon" title="Close preview">×</button>
+      </header>
+      <div id="preview-body"></div>
+    </section>
+  </aside>
+</div>
+
+<dialog id="settings">
+  <form id="settings-form" method="dialog">
+    <h2>Settings</h2>
+    <section>
+      <h3>Model providers</h3>
+      <p class="muted small">Paste an <a href="https://openrouter.ai/keys" target="_blank" rel="noopener">OpenRouter key</a> to reach most models with one account. Keys are saved to <code id="config-path"></code> (readable only by you); leave a field blank to keep the saved key or use the environment variable. ChatGPT (Codex login) reuses <code>~/.codex/auth.json</code> from the Codex CLI.</p>
+      <div id="provider-fields"></div>
+    </section>
+    <section>
+      <h3>Instructions</h3>
+      <textarea id="instructions" rows="4" placeholder="Added to the system prompt for every chat, e.g. your role, preferred citation style, tools you like."></textarea>
+    </section>
+    <section>
+      <h3>Connections and environment</h3>
+      <p class="muted small">Exported to the agent's shell, one <code>NAME=value</code> per line. Examples: <code>GH_TOKEN</code> for GitHub, <code>BRAVE_API_KEY</code> for reliable web search, or any API key your research needs. Saved values show as dots; leave them to keep them.</p>
+      <textarea id="env" rows="5" spellcheck="false" placeholder="BRAVE_API_KEY=..."></textarea>
+      <div id="gh-detail" class="muted small"></div>
+    </section>
+    <div id="settings-error" class="error-box" hidden></div>
+    <menu>
+      <button value="cancel" formnovalidate>Cancel</button>
+      <button id="settings-save" class="primary" value="save">Save</button>
+    </menu>
+  </form>
+</dialog>
+
+<script src="vendor/marked.js"></script>
+<script src="vendor/purify.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

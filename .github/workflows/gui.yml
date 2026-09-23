@@ -1,0 +1,35 @@
+name: GUI
+
+on:
+  push:
+    branches: [main]
+    paths: ['gui/**', 'harness/**', 'go.mod', 'go.sum', '.github/workflows/gui.yml']
+  pull_request:
+    paths: ['gui/**', 'harness/**', 'go.mod', 'go.sum', '.github/workflows/gui.yml']
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  gui:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS builds the native window (cgo); Linux builds the browser fallback.
+        os: [macos-15, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: gui
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: gui/go.mod
+          cache: false
+      - run: make check test build
