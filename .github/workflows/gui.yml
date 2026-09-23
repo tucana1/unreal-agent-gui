@@ -3,9 +3,7 @@ name: GUI
 on:
   push:
     branches: [main]
-    paths: ['gui/**', 'harness/**', 'go.mod', 'go.sum', '.github/workflows/gui.yml']
   pull_request:
-    paths: ['gui/**', 'harness/**', 'go.mod', 'go.sum', '.github/workflows/gui.yml']
   workflow_dispatch:
 
 permissions: {}
@@ -33,3 +31,15 @@ jobs:
           go-version-file: gui/go.mod
           cache: false
       - run: make check test build
+
+  secrets:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Reports file and line only, never the matched value.
+      - run: gui/scripts/check-secrets.sh

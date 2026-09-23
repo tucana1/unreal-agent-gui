@@ -64,7 +64,8 @@ const S = {
   filesDir: '',
   previewPath: null,
   usage: { input: 0, output: 0, cached: 0 },
-  models: {},
+  opCalls: new Map(), // operation ID → tool call card
+  approvals: [],
 };
 
 const sessionMeta = () => S.state?.sessions.find(s => s.id === S.session);
@@ -219,7 +220,7 @@ function addCall(call) {
   const el = h('details', { class: 'tool' },
     h('summary', {}, h('span', { class: 'tname' }, label), h('code', { class: 'targ', title: text }, firstLine(text)), state),
     body);
-  S.calls.set(call.CallID, { el, state, body, done: false });
+  S.calls.set(call.CallID, { el, state, body, summary: el.querySelector('summary'), done: false });
   append(el);
 }
 
@@ -230,6 +231,7 @@ function setCallState(call, className, label) {
 
 function finishCall(call, ok, label, text) {
   call.done = true;
+  call.actions?.remove();
   setCallState(call, ok ? 'done' : 'error', label);
   if (text) call.body.append(h('pre', {}, text));
   scheduleFilesRefresh();
@@ -243,6 +245,8 @@ function updateCall(data) {
   const operations = data.Operations || [];
   const op = operations.find(o => (status.WaitingFor || []).includes(o.ID)) || operations[0];
   if (!op) return;
+  S.opCalls.set(op.ID, call);
+  call.op = op.ID;
   if (['ready', 'awaiting', 'canceling'].includes(op.Status)) {
     setCallState(call, 'running', op.Status === 'canceling' ? 'canceling' : 'running');
     return;
@@ -254,7 +258,8 @@ function updateCall(data) {
     if (!result && state.OutPath) output = `Output saved to ${state.OutPath}`;
     const failure = state.TerminalError || (op.Status !== 'completed' ? `shell ${op.Status}` : '');
     const code = result ? result.ExitCode : null;
-    const label = failure ? (op.Status === 'canceled' ? 'canceled' : 'failed') : code === 0 ? 'done' : `exit ${code}`;
+    const declined = failure.startsWith('The user declined');
+    const label = declined ? 'declined' : failure ? (op.Status === 'canceled' ? 'canceled' : 'failed') : code === 0 ? 'done' : `exit ${code}`;
     finishCall(call, !failure && code === 0, label, [output || (failure ? '' : '(no output)'), failure].filter(Boolean).join('\n'));
   } else if (op.Type === 'view_image') {
     const result = state.Result || {};
@@ -266,6 +271,45 @@ function updateCall(data) {
     const ok = op.Status === 'completed';
     finishCall(call, ok, ok ? 'done' : op.Status, state.TerminalError || '');
   }
+}
+
+function renderApprovals(approvals) {
+  S.approvals = approvals || [];
+  const waiting = new Set(S.approvals.map(a => a.id));
+  for (const [id, call] of S.opCalls) {
+    if (waiting.has(id) && !call.done) {
+      if (!call.actions) {
+        const decide = approve => event => {
+          event.preventDefault();
+          event.stopPropagation();
+          approve_(id, approve);
+        };
+        call.actions = h('span', { class: 'approve-actions' },
+          h('button', { class: 'primary', onclick: decide(true) }, 'Approve'),
+          h('button', { onclick: decide(false) }, 'Decline'));
+        call.summary.append(call.actions);
+      }
+      setCallState(call, 'approval', 'needs approval');
+    } else if (call.actions) {
+      call.actions.remove();
+      call.actions = null;
+      if (!call.done) setCallState(call, 'running', 'running');
+    }
+  }
+  const count = S.approvals.length;
+  $('#approval-bar').hidden = count === 0;
+  $('#approval-text').textContent = count === 1
+    ? 'The agent wants to run a command.'
+    : `The agent wants to run ${count} commands.`;
+  $('#approve-all').hidden = count < 2;
+  $('#decline-all').hidden = count < 2;
+  if (count && nearBottom()) scrollToBottom();
+}
+
+async function approve_(id, approve) {
+  try {
+    await api('POST', `/api/sessions/${S.session}/approve`, { id, approve });
+  } catch (error) { showBanner(error.message); }
 }
 
 function renderUsage() {
@@ -283,6 +327,8 @@ function openSession(id) {
   S.session = id;
   S.lastSeq = 0;
   S.calls.clear();
+  S.opCalls.clear();
+  renderApprovals([]);
   S.usage = { input: 0, output: 0, cached: 0 };
   S.running = false;
   renderUsage();
@@ -315,7 +361,8 @@ function openSession(id) {
   events.addEventListener('status', event => setStatus(JSON.parse(event.data)));
 }
 
-function setStatus({ running, error }) {
+function setStatus({ running, error, approvals }) {
+  renderApprovals(approvals);
   const changed = S.running !== running;
   S.running = running;
   $('#stop').hidden = !running;
@@ -451,25 +498,29 @@ function hideBanner() {
 // ---------- toolbar ----------
 
 function currentProvider() {
-  return S.state.providers.find(p => p.name === S.state.config.provider) || S.state.providers[0];
+  return S.state.providers.find(p => p.name === S.state.config.provider);
 }
 
+// The toolbar offers only providers that have a key (or were enabled), their
+// curated models, and the effort levels.
 function renderToolbar() {
   const { config, providers, thinking } = S.state;
+  const available = providers.filter(p => config.available.includes(p.name));
   const provider = currentProvider();
-  const select = $('#provider');
-  if (select.options.length !== providers.length) {
-    select.replaceChildren(...providers.map(p => h('option', { value: p.name }, p.label)));
-  }
-  select.value = provider.name;
-  const levels = $('#thinking');
-  if (levels.options.length !== thinking.length) {
-    levels.replaceChildren(...thinking.map(level => h('option', { value: level }, `think: ${level}`)));
-  }
-  levels.value = config.thinking;
-  const model = $('#model');
-  if (document.activeElement !== model) model.value = config.models[provider.name] || '';
-  model.placeholder = provider.default_model || 'model id';
+  $('#add-key').hidden = available.length > 0;
+  for (const id of ['#provider', '#model', '#thinking', '#permission', '#websearch-label']) $(id).hidden = !provider;
+  if (!provider) return;
+  $('#provider').replaceChildren(...available.map(p => h('option', { value: p.name }, p.label)));
+  $('#provider').value = provider.name;
+  $('#provider').disabled = available.length < 2;
+  const selected = config.selected[provider.name];
+  const models = provider.models.length ? provider.models : [{ id: selected, label: selected }];
+  $('#model').replaceChildren(...models.map(m => h('option', { value: m.id, title: m.id }, m.label)));
+  $('#model').value = selected;
+  $('#model').disabled = models.length < 2;
+  $('#thinking').replaceChildren(...thinking.map(level => h('option', { value: level }, `effort: ${level}`)));
+  $('#thinking').value = config.thinking;
+  $('#permission').value = config.permission;
   const web = $('#websearch');
   web.checked = config.web_search && provider.hosted_search;
   web.disabled = !provider.hosted_search;
@@ -477,24 +528,6 @@ function renderToolbar() {
   $('#websearch-label').title = provider.hosted_search
     ? 'Provider-hosted web search. The web-research skill works either way.'
     : `${provider.label} has no hosted search; the agent uses the web-research skill instead.`;
-  loadModels(provider);
-}
-
-async function loadModels(provider) {
-  if (!provider.list_models || S.models[provider.name]) {
-    fillModels(S.models[provider.name] || []);
-    return;
-  }
-  S.models[provider.name] = [];
-  try {
-    const result = await api('GET', `/api/models?${query({ provider: provider.name })}`);
-    S.models[provider.name] = result.models;
-  } catch { /* the model field still accepts any id */ }
-  if (currentProvider().name === provider.name) fillModels(S.models[provider.name]);
-}
-
-function fillModels(models) {
-  $('#model-list').replaceChildren(...models.map(id => h('option', { value: id })));
 }
 
 async function saveConfig(update) {
@@ -623,10 +656,16 @@ async function openSettings(focusProvider) {
     const keyPlaceholder = !p.key_env ? 'no key needed'
       : status === 'saved' ? 'saved (type to replace, - to clear)'
       : status === 'env' ? `using $${p.key_env}` : `API key or $${p.key_env}`;
+    const access = p.key_env
+      ? h('input', { type: 'password', 'data-key': p.name, placeholder: keyPlaceholder, autocomplete: 'off' })
+      : h('label', { class: 'toggle' }, h('input', { type: 'checkbox', 'data-enable': p.name, checked: !!config.enabled[p.name] }),
+        p.name === 'openai-codex' ? 'Use my Codex CLI login' : 'Enable');
     return h('div', { class: 'provider-field' },
       h('label', {}, p.label),
-      h('input', { type: 'password', 'data-key': p.name, placeholder: keyPlaceholder, disabled: !p.key_env, autocomplete: 'off' }),
-      h('input', { 'data-base': p.name, placeholder: p.base_url, value: config.base_urls[p.name] || '', spellcheck: 'false', title: 'Base URL override' }));
+      access,
+      p.models.length
+        ? h('input', { 'data-base': p.name, placeholder: p.base_url, value: config.base_urls[p.name] || '', spellcheck: 'false', title: 'Base URL override (optional)' })
+        : h('input', { 'data-model': p.name, placeholder: 'model ID', value: config.selected[p.name] || '', spellcheck: 'false', title: 'Model ID for this provider' }));
   }));
   $('#instructions').value = config.instructions || '';
   $('#env').value = Object.entries(config.env).map(([name, value]) => `${name}=${value}`).join('\n');
@@ -652,14 +691,15 @@ async function saveSettings(event) {
     if (at <= 0) { settingsError(`Expected NAME=value: ${trimmed}`); return; }
     env[trimmed.slice(0, at).trim()] = trimmed.slice(at + 1).trim();
   }
-  const apiKeys = {}, baseURLs = {};
+  const apiKeys = {}, baseURLs = {}, models = {}, enabled = {};
   for (const input of document.querySelectorAll('[data-key]')) if (input.value.trim()) apiKeys[input.dataset.key] = input.value.trim();
   for (const input of document.querySelectorAll('[data-base]')) baseURLs[input.dataset.base] = input.value.trim();
+  for (const input of document.querySelectorAll('[data-model]')) models[input.dataset.model] = input.value.trim();
+  for (const input of document.querySelectorAll('[data-enable]')) enabled[input.dataset.enable] = input.checked;
   try {
     S.state.config = await api('PUT', '/api/config', {
-      api_keys: apiKeys, base_urls: baseURLs, env, instructions: $('#instructions').value,
+      api_keys: apiKeys, base_urls: baseURLs, models, enabled, env, instructions: $('#instructions').value,
     });
-    S.models = {};
     $('#settings').close();
     renderToolbar();
     refreshGitHub();
@@ -737,7 +777,11 @@ function wire() {
   $('#provider').addEventListener('change', event => saveConfig({ provider: event.target.value }));
   $('#thinking').addEventListener('change', event => saveConfig({ thinking: event.target.value }));
   $('#websearch').addEventListener('change', event => saveConfig({ web_search: event.target.checked }));
-  $('#model').addEventListener('change', event => saveConfig({ models: { [currentProvider().name]: event.target.value.trim() } }));
+  $('#model').addEventListener('change', event => saveConfig({ models: { [currentProvider().name]: event.target.value } }));
+  $('#permission').addEventListener('change', event => saveConfig({ permission: event.target.value }));
+  $('#add-key').addEventListener('click', () => openSettings('openrouter'));
+  $('#approve-all').addEventListener('click', () => approve_('', true));
+  $('#decline-all').addEventListener('click', () => approve_('', false));
 
   $('#toggle-side').addEventListener('click', () => {
     localStorage.setItem('uag.side', document.body.classList.toggle('hide-side') ? '0' : '1');
@@ -789,8 +833,7 @@ async function start() {
   openSession(S.state.sessions.some(s => s.id === saved) ? saved : null);
   refreshGitHub();
   // First run: ask for the provider's key before the first message fails.
-  const provider = currentProvider();
-  if (provider.key_env && !S.state.config.key_status[provider.name]) openSettings(provider.name);
+  if (!currentProvider()) openSettings('openrouter');
 }
 
 start();

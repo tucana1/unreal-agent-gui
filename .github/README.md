@@ -11,7 +11,9 @@ This repository is a fork of `unreallabsai/unreal-agent`. Everything added lives
 - **Attachments.** Attach, paste, or drop files. They are saved to `uploads/` in the workspace; the agent views images with the harness's `ViewImage` tool and reads documents with the `documents` skill.
 - **Document previews.** The Files panel previews Markdown, PDF, images, HTML, CSV, JSON, code, audio, and video, and extracts text from Word, PowerPoint, Excel, and OpenDocument files.
 - **GitHub.** A `github` skill drives the `gh` CLI. The sidebar shows whether `gh` is logged in.
-- **Any provider the harness supports:** OpenRouter (the default, with `openai/gpt-6-astra`), OpenAI, ChatGPT through an existing Codex CLI login, Fireworks, and Ollama.
+- **OpenRouter first.** One OpenRouter key gives two model choices for now: **Nemotron 3 Super** (`nvidia/nemotron-3-super-120b-a12b:free`, $0, the default) and **GPT-6 Astra** (`openai/gpt-6-astra`, the model Unreal Labs benchmarked the harness with). The toolbar lists only providers you have added a key for; OpenAI, a ChatGPT Codex login, Fireworks, and Ollama can be added in Settings.
+- **Effort levels** from `low` to `max`, passed to the model as reasoning effort.
+- **Two permission levels.** *Ask first* (the default) holds every shell command until you approve or decline it in the chat. *Full auto* runs commands without asking. Because the harness is asynchronous, a command waiting for approval does not block the agent; it keeps working on anything else.
 
 Sessions use the harness's own append-only session store, so chats resume after a restart. Skills you put in `<workspace>/.harness/skills/` work as they do with the upstream runner.
 
@@ -27,7 +29,7 @@ make install-app      # builds "Unreal Agent.app" into ~/Applications
 
 Or run it without installing: `make run`.
 
-On first launch, Settings opens so you can paste an [OpenRouter API key](https://openrouter.ai/keys). Pick any model in the toolbar; the list comes from the provider.
+On first launch, Settings opens so you can paste an [OpenRouter API key](https://openrouter.ai/keys). Free models are rate-limited by OpenRouter, and free providers may log prompts; switch to GPT-6 Astra in the toolbar for serious work.
 
 Useful extras:
 
@@ -41,9 +43,15 @@ The native window is macOS-only for now. Elsewhere, `go build` produces a binary
 
 ## Security
 
-The agent runs shell commands **on your computer with your permissions**, not in a sandbox. Point it at a workspace folder you are comfortable with, and review what it does. The skills tell it to ask before destructive or outward-facing actions, but that is guidance, not enforcement.
+The agent runs shell commands **on your computer with your permissions**, not in a sandbox. In *Ask first* mode nothing runs until you approve it; in *Full auto* it runs whatever the model decides, so use that mode only with a workspace and task you trust. Web pages the agent reads can try to instruct it (prompt injection), which is another reason to keep *Ask first* for unfamiliar sources.
 
-The app's local API listens only on loopback. It requires a per-install token cookie (`SameSite=Strict`) plus a custom header for state changes, and rejects non-loopback `Host` headers. Workspace files are previewed under a sandbox CSP so agent-written HTML cannot call the API. Settings, including API keys, are stored in `~/Library/Application Support/unreal-agent-gui/config.json` with mode 600.
+The app's local API listens only on loopback. It requires a per-install token cookie (`SameSite=Strict`) plus a custom header for state changes, and rejects non-loopback `Host` headers. Workspace files are previewed under a sandbox CSP so agent-written HTML cannot call the API. API keys are stored only in `~/Library/Application Support/unreal-agent-gui/config.json` (mode 600), are never returned to the UI, and are not exported to the agent's shell. The system prompt tells the agent never to read or send them.
+
+### Keeping secrets out of this repository
+
+- `gui/scripts/check-secrets.sh` scans files and commits for API keys, tokens, and private keys, plus any key saved in your local app settings. It reports file and line only.
+- `gui/scripts/install-hooks.sh` installs a pre-push hook that runs it on everything you push. Run it once after cloning.
+- CI runs the same scan, and GitHub secret scanning with push protection is enabled on this repository.
 
 ## How it's built
 

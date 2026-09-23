@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/unreallabsai/unreal-agent/harness/operation"
 )
 
 // Upstream keeps its provider table in an internal package, so this test
@@ -194,5 +196,107 @@ func TestFilesStayInWorkspace(t *testing.T) {
 		if w.Code == http.StatusOK || strings.Contains(w.Body.String(), "secret\"") || w.Body.String() == "secret" {
 			t.Errorf("%s escaped the workspace: %d %q", path, w.Code, w.Body.String())
 		}
+	}
+}
+
+func TestProviderAvailability(t *testing.T) {
+	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("FIREWORKS_API_KEY", "")
+	cfg := defaultConfig()
+	if _, ok := cfg.selectedProvider(); ok {
+		t.Fatal("a provider is available without any key")
+	}
+	cfg.APIKeys = map[string]string{"openrouter": "test-key"}
+	p, ok := cfg.selectedProvider()
+	if !ok || p.Name != "openrouter" {
+		t.Fatalf("selected = %q, %v", p.Name, ok)
+	}
+	if got := p.model(cfg); got != p.Models[0].ID || !strings.HasSuffix(got, ":free") {
+		t.Fatalf("default model = %q, want the free option", got)
+	}
+	cfg.Models = map[string]string{"openrouter": "some/unlisted-model"}
+	if got := p.model(cfg); got != p.Models[0].ID {
+		t.Fatalf("unlisted model %q was accepted", got)
+	}
+	codex, _ := providerNamed("openai-codex")
+	if codex.available(cfg) {
+		t.Fatal("Codex login is available without opting in")
+	}
+	cfg.Enabled = map[string]bool{"openai-codex": true}
+	if !codex.available(cfg) {
+		t.Fatal("enabled Codex login is unavailable")
+	}
+	ollama, _ := providerNamed("ollama")
+	cfg.Enabled["ollama"] = true
+	if ollama.available(cfg) {
+		t.Fatal("Ollama is available without a model ID")
+	}
+}
+
+type fakeManager struct {
+	added   []operation.Operation
+	updates chan operation.Operation
+}
+
+func (m *fakeManager) Add(op operation.Operation) error    { m.added = append(m.added, op); return nil }
+func (m *fakeManager) Cancel(operation.ID, string) error   { return nil }
+func (m *fakeManager) Updates() <-chan operation.Operation { return m.updates }
+
+func shellOperation(t *testing.T, id, command string) operation.Operation {
+	t.Helper()
+	spec, err := operation.NewShellSpec(operation.ShellInput{Command: command, Shell: "/bin/sh", Directory: "/tmp"}, t.TempDir(), 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return operation.Operation{
+		ID: operation.ID(id), Type: spec.Type, Version: spec.Version, Status: operation.StatusReady,
+		State: spec.State, MaxOutputLength: spec.MaxOutputLength,
+	}
+}
+
+func TestApprovalGate(t *testing.T) {
+	next := &fakeManager{updates: make(chan operation.Operation)}
+	ask := true
+	changes := 0
+	gate := newApprovalGate(t.Context(), next, func() bool { return ask }, func() { changes++ })
+
+	gate.Add(shellOperation(t, "a", "rm -rf build"))
+	gate.Add(shellOperation(t, "b", "ls"))
+	gate.Add(operation.Operation{ID: "img", Type: operation.TypeViewImage, Status: operation.StatusReady})
+	if len(next.added) != 1 || next.added[0].ID != "img" {
+		t.Fatalf("only non-shell operations should pass through in ask mode: %v", next.added)
+	}
+	if list := gate.list(); len(list) != 2 || list[0].Command != "rm -rf build" {
+		t.Fatalf("pending = %+v", list)
+	}
+
+	if err := gate.decide("b", true); err != nil || len(next.added) != 2 || next.added[1].ID != "b" {
+		t.Fatalf("approve: %v, added %v", err, next.added)
+	}
+	if err := gate.decide("a", false); err != nil {
+		t.Fatal(err)
+	}
+	declined := <-gate.Updates()
+	state, err := operation.DecodeShellState(declined)
+	if err != nil || declined.ID != "a" || declined.Status != operation.StatusFailed || !strings.Contains(state.TerminalError, "declined") {
+		t.Fatalf("declined update = %+v, %+v, %v", declined, state, err)
+	}
+
+	gate.Add(shellOperation(t, "c", "sleep 1"))
+	if err := gate.Cancel("c", "stopped"); err != nil {
+		t.Fatal(err)
+	}
+	if canceled := <-gate.Updates(); canceled.ID != "c" || canceled.Status != operation.StatusCanceled {
+		t.Fatalf("canceled update = %+v", canceled)
+	}
+
+	ask = false
+	gate.Add(shellOperation(t, "d", "echo auto"))
+	if last := next.added[len(next.added)-1]; last.ID != "d" || len(gate.list()) != 0 {
+		t.Fatal("full auto should run commands without holding them")
+	}
+	if changes == 0 {
+		t.Fatal("pending changes were not reported")
 	}
 }

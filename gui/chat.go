@@ -58,6 +58,7 @@ type chat struct {
 	cancel  context.CancelFunc
 	pending []inbox.Input // submitted external inputs not yet persisted
 	lastErr string
+	gate    *approvalGate // the running coordinator's; nil when idle
 }
 
 func (app *App) chat(id session.ID) (*chat, error) {
@@ -145,8 +146,29 @@ func (c *chat) broadcastLocked(ev event) {
 }
 
 func (c *chat) statusLocked() event {
-	encoded, _ := json.Marshal(map[string]any{"running": c.running, "error": c.lastErr})
+	approvals := []pendingApproval{}
+	if c.gate != nil {
+		approvals = c.gate.list()
+	}
+	encoded, _ := json.Marshal(map[string]any{"running": c.running, "error": c.lastErr, "approvals": approvals})
 	return event{name: "status", data: encoded}
+}
+
+func (c *chat) approvalsChanged() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.broadcastLocked(c.statusLocked())
+}
+
+// decide approves or declines a held command; an empty id applies to all.
+func (c *chat) decide(id operation.ID, approve bool) error {
+	c.mu.Lock()
+	gate := c.gate
+	c.mu.Unlock()
+	if gate == nil {
+		return errors.New("nothing is waiting for approval")
+	}
+	return gate.decide(id, approve)
 }
 
 func (c *chat) subscribe(after uint64) ([]storedItem, chan event, event) {
@@ -226,13 +248,13 @@ func (c *chat) stop() error {
 
 func (c *chat) startLocked() error {
 	ctx, cancel := context.WithCancel(c.app.ctx)
-	run, err := c.app.prepareRun(ctx, c.id, slices.Clone(c.pending))
+	run, err := c.app.prepareRun(ctx, c.id, slices.Clone(c.pending), c.approvalsChanged)
 	if err != nil {
 		cancel()
 		return err
 	}
 	c.running, c.stopped = true, false
-	c.inbox, c.ctx, c.cancel = run.inbox, ctx, cancel
+	c.inbox, c.ctx, c.cancel, c.gate = run.inbox, ctx, cancel, run.gate
 	c.broadcastLocked(c.statusLocked())
 	c.app.runs.Add(1)
 	go func() {
@@ -247,7 +269,7 @@ func (c *chat) startLocked() error {
 func (c *chat) finished(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.running, c.inbox = false, nil
+	c.running, c.inbox, c.gate = false, nil, nil
 	if c.stopped {
 		c.pending = nil
 	}
@@ -267,23 +289,21 @@ func (c *chat) finished(err error) {
 type preparedRun struct {
 	coordinator coordinator.Coordinator
 	inbox       *inbox.Inbox
+	gate        *approvalGate
 	close       func() error
 }
 
-func (app *App) prepareRun(ctx context.Context, id session.ID, inputs []inbox.Input) (preparedRun, error) {
+func (app *App) prepareRun(ctx context.Context, id session.ID, inputs []inbox.Input, approvalsChanged func()) (preparedRun, error) {
 	cfg := app.config()
 	meta, ok := app.session(id)
 	if !ok {
 		return preparedRun{}, fmt.Errorf("unknown session %s", id)
 	}
-	p, ok := providerNamed(cfg.Provider)
+	p, ok := cfg.selectedProvider()
 	if !ok {
-		return preparedRun{}, fmt.Errorf("unknown provider %q", cfg.Provider)
+		return preparedRun{}, errors.New("add an API key in Settings to choose a model provider")
 	}
 	model := p.model(cfg)
-	if model == "" {
-		return preparedRun{}, fmt.Errorf("choose a model for %s in the toolbar", p.Label)
-	}
 	if err := os.MkdirAll(meta.Workspace, 0o755); err != nil {
 		return preparedRun{}, fmt.Errorf("create workspace: %w", err)
 	}
@@ -350,6 +370,8 @@ func (app *App) prepareRun(ctx context.Context, id session.ID, inputs []inbox.In
 			return fail(fmt.Errorf("submit input: %w", err))
 		}
 	}
+	gate := newApprovalGate(ctx, operation.NewLocalOperationManager(ctx),
+		func() bool { return app.config().Permission != permissionAuto }, approvalsChanged)
 	return preparedRun{
 		coordinator: coordinator.New(coordinator.Dependencies{
 			ToolHeartbeatInterval: toolHeartbeatInterval,
@@ -360,9 +382,10 @@ func (app *App) prepareRun(ctx context.Context, id session.ID, inputs []inbox.In
 			ContextBuilder:        builder,
 			LLM:                   llmClient,
 			Tools:                 registry,
-			Operations:            operation.NewLocalOperationManager(ctx),
+			Operations:            gate,
 		}),
 		inbox: in,
+		gate:  gate,
 		close: llmClient.Close,
 	}, nil
 }
@@ -393,6 +416,8 @@ func systemPrompt(workspace, instructions string, hostedSearch bool) string {
 	prompt.WriteString(`- Look at attached or generated images with ViewImage.
 - Cite web sources as markdown links. Link workspace files by relative path, like [report.md](report.md), so the user can click to preview them.
 - Ask before destructive or outward-facing actions: deleting or overwriting the user's files, pushing code, publishing, or sending messages on the user's behalf.
+- Never read, print, or send API keys, tokens, or the Unreal Agent settings folder (~/Library/Application Support/unreal-agent-gui), and never commit secrets.
+- Shell commands may wait for the user's approval. Continue with independent work meanwhile; if the user declines one, do not retry it unchanged.
 - Reply in GitHub-flavored markdown. Keep final answers concise and lead with the result.
 `)
 	if instructions != "" {

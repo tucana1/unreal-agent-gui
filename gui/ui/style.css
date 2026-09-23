@@ -122,7 +122,21 @@ a { color: var(--accent); }
 #title { display: flex; flex-direction: column; line-height: 1.25; overflow: hidden; }
 #title-text, #title-ws { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #title-text { font-weight: 600; }
-#model { width: 170px; }
+#model { max-width: 240px; }
+#approval-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 auto 6px;
+  width: min(820px, calc(100% - 40px));
+  padding: 6px 10px;
+  border-radius: var(--radius);
+  background: color-mix(in srgb, #e9a23b 16%, var(--bg));
+}
+#approval-text { flex: 1; }
+.tstate.approval { color: #c47f10; font-weight: 600; }
+.approve-actions { display: flex; gap: 6px; flex: none; }
+.approve-actions button { padding: 1px 8px; font-size: 12px; }
 .toggle { display: flex; align-items: center; gap: 4px; font-size: 13px; cursor: pointer; white-space: nowrap; }
 .toggle.disabled { opacity: .5; }
 
@@ -315,5 +329,5 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 
 body.hide-side #sidebar, body.hide-files #files { display: none; }
 @media (max-width: 760px) {
-  #model { width: 110px; }
+  #model { max-width: 120px; }
 }

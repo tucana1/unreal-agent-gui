@@ -104,6 +104,19 @@ func (app *App) shutdown(cancel context.CancelFunc, timeout time.Duration) {
 	}
 }
 
+// approveAll releases every held command, for switching to full auto.
+func (app *App) approveAll() {
+	app.chatsMu.Lock()
+	chats := make([]*chat, 0, len(app.chats))
+	for _, current := range app.chats {
+		chats = append(chats, current)
+	}
+	app.chatsMu.Unlock()
+	for _, current := range chats {
+		current.decide("", true)
+	}
+}
+
 func (app *App) path(name string) string {
 	return filepath.Join(app.dataDir, name)
 }

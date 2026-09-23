@@ -1,18 +1,15 @@
 package main
 
 import (
-	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
-	"time"
 
 	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/fireworks"
@@ -38,6 +35,10 @@ type Config struct {
 	Workspace    string            `json:"workspace"`
 	Instructions string            `json:"instructions"`
 	Env          map[string]string `json:"env"`
+	// Permission is "ask" (approve each shell command) or "auto".
+	Permission string `json:"permission"`
+	// Enabled opts in to providers that need no key (Codex login, Ollama).
+	Enabled map[string]bool `json:"enabled"`
 }
 
 type configUpdate struct {
@@ -50,6 +51,8 @@ type configUpdate struct {
 	Workspace    *string           `json:"workspace"`
 	Instructions *string           `json:"instructions"`
 	Env          map[string]string `json:"env"`
+	Permission   *string           `json:"permission"`
+	Enabled      map[string]bool   `json:"enabled"`
 }
 
 type client interface {
@@ -61,35 +64,54 @@ type client interface {
 // is internal to the upstream module. TestProvidersMatchUpstream fails when
 // upstream adds a provider this table lacks.
 type provider struct {
-	Name         string `json:"name"`
-	Label        string `json:"label"`
-	BaseURL      string `json:"base_url"`
-	DefaultModel string `json:"default_model"`
-	KeyEnv       string `json:"key_env"`
-	HostedSearch bool   `json:"hosted_search"`
-	ListModels   bool   `json:"list_models"`
+	Name    string `json:"name"`
+	Label   string `json:"label"`
+	BaseURL string `json:"base_url"`
+	KeyEnv  string `json:"key_env"`
+	// Models are the choices offered in the toolbar, cheapest first. Providers
+	// without a curated list take a model ID in Settings.
+	Models       []modelOption `json:"models"`
+	HostedSearch bool          `json:"hosted_search"`
 	newClient    func(key, baseURL string) (client, error)
 }
 
-// OpenRouter comes first: one key reaches most models. Its default is the
-// model Unreal Labs benchmarked the harness with.
+type modelOption struct {
+	ID    string `json:"id"`
+	Label string `json:"label"`
+}
+
+// OpenRouter comes first: one key reaches most models. Each curated list pairs
+// the cheapest model that handles the harness's tool calls with GPT-6 Astra,
+// the model Unreal Labs benchmarked the harness with.
 var providers = []provider{
 	{
 		Name: "openrouter", Label: "OpenRouter", BaseURL: "https://openrouter.ai/api/v1",
-		DefaultModel: "openai/gpt-6-astra", KeyEnv: "OPENROUTER_API_KEY", ListModels: true,
+		KeyEnv: "OPENROUTER_API_KEY",
+		Models: []modelOption{
+			{ID: "nvidia/nemotron-3-super-120b-a12b:free", Label: "Nemotron 3 Super · free"},
+			{ID: "openai/gpt-6-astra", Label: "GPT-6 Astra · best"},
+		},
 		newClient: func(key, baseURL string) (client, error) {
 			return openrouter.NewClient(openrouter.Config{APIKey: key, BaseURL: baseURL})
 		},
 	},
 	{
 		Name: "openai", Label: "OpenAI", BaseURL: "https://api.openai.com/v1",
-		DefaultModel: "gpt-6-astra", KeyEnv: "OPENAI_API_KEY", HostedSearch: true, ListModels: true,
+		KeyEnv: "OPENAI_API_KEY", HostedSearch: true,
+		Models: []modelOption{
+			{ID: "gpt-6-luna", Label: "GPT-6 Luna · cheaper"},
+			{ID: "gpt-6-astra", Label: "GPT-6 Astra · best"},
+		},
 		newClient: func(key, baseURL string) (client, error) {
 			return openai.NewClient(openai.Config{APIKey: key, BaseURL: baseURL})
 		},
 	},
 	{
 		Name: "openai-codex", Label: "ChatGPT (Codex login)", BaseURL: openaicodex.BaseURL, HostedSearch: true,
+		Models: []modelOption{
+			{ID: "gpt-6-sol", Label: "GPT-6 Sol"},
+			{ID: "gpt-6-astra", Label: "GPT-6 Astra · best"},
+		},
 		newClient: func(_, baseURL string) (client, error) {
 			config, err := openaicodex.EnvironmentConfig(os.Getenv)
 			if err != nil {
@@ -101,13 +123,13 @@ var providers = []provider{
 	},
 	{
 		Name: "fireworks", Label: "Fireworks", BaseURL: "https://api.fireworks.ai/inference/v1",
-		KeyEnv: "FIREWORKS_API_KEY", ListModels: true,
+		KeyEnv: "FIREWORKS_API_KEY",
 		newClient: func(key, baseURL string) (client, error) {
 			return fireworks.NewClient(fireworks.Config{APIKey: key, BaseURL: baseURL})
 		},
 	},
 	{
-		Name: "ollama", Label: "Ollama (local)", BaseURL: ollama.BaseURL, ListModels: true,
+		Name: "ollama", Label: "Ollama (local)", BaseURL: ollama.BaseURL,
 		newClient: func(_, baseURL string) (client, error) {
 			return ollama.NewClient(ollama.Config{BaseURL: baseURL})
 		},
@@ -139,11 +161,44 @@ func (p provider) apiKey(cfg Config) string {
 	return ""
 }
 
+// model is the selected model: one of the curated options (the cheapest by
+// default), or the ID typed in Settings for providers without a list.
 func (p provider) model(cfg Config) string {
-	if model := strings.TrimSpace(cfg.Models[p.Name]); model != "" {
-		return model
+	chosen := strings.TrimSpace(cfg.Models[p.Name])
+	if len(p.Models) == 0 {
+		return chosen
 	}
-	return p.DefaultModel
+	if slices.ContainsFunc(p.Models, func(m modelOption) bool { return m.ID == chosen }) {
+		return chosen
+	}
+	return p.Models[0].ID
+}
+
+// available reports whether the provider can be selected: it has a key, or
+// the user enabled a keyless provider, and it has a model.
+func (p provider) available(cfg Config) bool {
+	if p.KeyEnv != "" {
+		if p.apiKey(cfg) == "" {
+			return false
+		}
+	} else if !cfg.Enabled[p.Name] {
+		return false
+	}
+	return p.model(cfg) != ""
+}
+
+// selectedProvider is the configured provider if available, otherwise the
+// first available one.
+func (cfg Config) selectedProvider() (provider, bool) {
+	if p, ok := providerNamed(cfg.Provider); ok && p.available(cfg) {
+		return p, true
+	}
+	for _, p := range providers {
+		if p.available(cfg) {
+			return p, true
+		}
+	}
+	return provider{}, false
 }
 
 func (p provider) connect(cfg Config) (client, error) {
@@ -158,53 +213,14 @@ func (p provider) connect(cfg Config) (client, error) {
 	return c, nil
 }
 
-// models lists model IDs from an OpenAI-compatible /models endpoint.
-func (p provider) models(ctx context.Context, cfg Config) ([]string, error) {
-	if !p.ListModels {
-		return nil, nil
-	}
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.baseURL(cfg), "/")+"/models", nil)
-	if err != nil {
-		return nil, err
-	}
-	if key := p.apiKey(cfg); key != "" {
-		request.Header.Set("Authorization", "Bearer "+key)
-	}
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return nil, err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("list models: HTTP %d", response.StatusCode)
-	}
-	var body struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.UnmarshalRead(response.Body, &body); err != nil {
-		return nil, fmt.Errorf("decode models: %w", err)
-	}
-	ids := make([]string, 0, len(body.Data))
-	for _, model := range body.Data {
-		if !strings.HasSuffix(model.ID, ":batch") {
-			ids = append(ids, model.ID)
-		}
-	}
-	slices.Sort(ids)
-	return ids, nil
-}
-
 func defaultConfig() Config {
 	home, _ := os.UserHomeDir()
 	return Config{
-		Provider:  "openrouter",
-		Thinking:  "high",
-		WebSearch: true,
-		Workspace: filepath.Join(home, "UnrealAgent"),
+		Provider:   "openrouter",
+		Thinking:   "high",
+		WebSearch:  true,
+		Permission: permissionAsk,
+		Workspace:  filepath.Join(home, "UnrealAgent"),
 	}
 }
 
@@ -246,8 +262,23 @@ func (cfg Config) view() map[string]any {
 	for name := range cfg.Env {
 		env[name] = secretMask
 	}
+	available := []string{}
+	for _, p := range providers {
+		if p.available(cfg) {
+			available = append(available, p.Name)
+		}
+	}
+	selected := map[string]string{}
+	for _, p := range providers {
+		selected[p.Name] = p.model(cfg)
+	}
+	current, _ := cfg.selectedProvider()
 	return map[string]any{
-		"provider":     cfg.Provider,
+		"provider":     current.Name,
+		"available":    available,
+		"selected":     selected,
+		"permission":   cfg.Permission,
+		"enabled":      nonNilBools(cfg.Enabled),
 		"models":       nonNil(cfg.Models),
 		"base_urls":    nonNil(cfg.BaseURLs),
 		"key_status":   keys,
@@ -297,6 +328,21 @@ func (cfg Config) apply(update configUpdate) (Config, error) {
 	}
 	if update.Instructions != nil {
 		next.Instructions = strings.TrimSpace(*update.Instructions)
+	}
+	if update.Permission != nil {
+		if *update.Permission != permissionAsk && *update.Permission != permissionAuto {
+			return cfg, fmt.Errorf("permission must be %q or %q", permissionAsk, permissionAuto)
+		}
+		next.Permission = *update.Permission
+	}
+	if update.Enabled != nil {
+		next.Enabled = make(map[string]bool, len(cfg.Enabled))
+		for name, on := range cfg.Enabled {
+			next.Enabled[name] = on
+		}
+		for name, on := range update.Enabled {
+			next.Enabled[name] = on
+		}
 	}
 	if update.Env != nil {
 		next.Env = make(map[string]string, len(update.Env))
@@ -356,6 +402,13 @@ func cloneStrings(source map[string]string) map[string]string {
 		copied[key] = value
 	}
 	return copied
+}
+
+func nonNilBools(source map[string]bool) map[string]bool {
+	if source == nil {
+		return map[string]bool{}
+	}
+	return source
 }
 
 func nonNil(source map[string]string) map[string]string {

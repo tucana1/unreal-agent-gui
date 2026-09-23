@@ -26,6 +26,7 @@ import (
 	"time"
 	"uuid"
 
+	"github.com/unreallabsai/unreal-agent/harness/operation"
 	"github.com/unreallabsai/unreal-agent/harness/session"
 )
 
@@ -50,7 +51,6 @@ func (app *App) handler() http.Handler {
 	}))
 	mux.HandleFunc("GET /api/state", app.handleState)
 	mux.HandleFunc("PUT /api/config", app.handleConfig)
-	mux.HandleFunc("GET /api/models", app.handleModels)
 	mux.HandleFunc("GET /api/github", app.handleGitHub)
 	mux.HandleFunc("POST /api/pick-folder", app.handlePickFolder)
 	mux.HandleFunc("DELETE /api/sessions/{id}", app.handleDelete)
@@ -58,6 +58,7 @@ func (app *App) handler() http.Handler {
 	mux.HandleFunc("POST /api/sessions/{id}/messages", app.handleMessage)
 	mux.HandleFunc("POST /api/sessions/{id}/stop", app.handleStop)
 	mux.HandleFunc("POST /api/sessions/{id}/retry", app.handleRetry)
+	mux.HandleFunc("POST /api/sessions/{id}/approve", app.handleApprove)
 	mux.HandleFunc("GET /api/files", app.handleFiles)
 	mux.HandleFunc("GET /api/raw", app.handleRaw)
 	mux.HandleFunc("GET /api/text", app.handleText)
@@ -159,21 +160,10 @@ func (app *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
+	if update.Permission != nil && cfg.Permission == permissionAuto {
+		app.approveAll()
+	}
 	writeJSON(w, http.StatusOK, cfg.view())
-}
-
-func (app *App) handleModels(w http.ResponseWriter, r *http.Request) {
-	p, ok := providerNamed(r.URL.Query().Get("provider"))
-	if !ok {
-		writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
-		return
-	}
-	models, err := p.models(r.Context(), app.config())
-	if err != nil {
-		writeJSON(w, http.StatusOK, map[string]any{"models": []string{}, "error": err.Error()})
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"models": models})
 }
 
 var ghAccount = regexp.MustCompile(`Logged in to (\S+) account (\S+)`)
@@ -383,6 +373,18 @@ func composeMessage(text string, attachments []string) string {
 		return block
 	}
 	return text + "\n\n" + block
+}
+
+func (app *App) handleApprove(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID      string `json:"id"` // empty for all
+		Approve bool   `json:"approve"`
+	}
+	if err := decodeBody(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	app.withChat(w, r, func(c *chat) error { return c.decide(operation.ID(body.ID), body.Approve) })
 }
 
 func (app *App) handleStop(w http.ResponseWriter, r *http.Request) {
