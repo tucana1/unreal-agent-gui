@@ -122,7 +122,33 @@ a { color: var(--accent); }
 #title { display: flex; flex-direction: column; line-height: 1.25; overflow: hidden; }
 #title-text, #title-ws { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #title-text { font-weight: 600; }
-#model { max-width: 240px; }
+#model-picker { position: relative; }
+#model-button { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#model-popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  width: min(520px, 90vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgb(0 0 0 / .18);
+}
+#model-search { margin: 8px; }
+#model-options { max-height: min(460px, 60vh); overflow-y: auto; padding: 0 4px 4px; }
+#model-hint { padding: 6px 12px 8px; border-top: 1px solid var(--line); }
+.model-section { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); padding: 8px 8px 2px; }
+.model-row { display: flex; align-items: baseline; gap: 10px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+.model-row.active { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+.model-row.current .model-name::after { content: " ✓"; color: var(--accent); }
+.model-main { flex: 1; min-width: 0; }
+.model-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-id { display: block; font-size: 11.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-meta { flex: none; font-size: 12px; color: var(--muted); text-align: right; white-space: nowrap; }
+.model-meta .free { color: var(--ok); font-weight: 600; }
 #approval-bar {
   display: flex;
   align-items: center;
@@ -329,5 +355,5 @@ dialog menu { display: flex; justify-content: flex-end; gap: 8px; padding: 0; ma
 
 body.hide-side #sidebar, body.hide-files #files { display: none; }
 @media (max-width: 760px) {
-  #model { max-width: 120px; }
+  #model-button { max-width: 130px; }
 }

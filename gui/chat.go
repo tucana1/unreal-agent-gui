@@ -304,6 +304,9 @@ func (app *App) prepareRun(ctx context.Context, id session.ID, inputs []inbox.In
 		return preparedRun{}, errors.New("add an API key in Settings to choose a model provider")
 	}
 	model := p.model(cfg)
+	if model == "" {
+		return preparedRun{}, fmt.Errorf("choose a %s model in the toolbar", p.Label)
+	}
 	if err := os.MkdirAll(meta.Workspace, 0o755); err != nil {
 		return preparedRun{}, fmt.Errorf("create workspace: %w", err)
 	}

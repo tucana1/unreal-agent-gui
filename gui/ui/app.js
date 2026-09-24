@@ -178,7 +178,7 @@ function addResponse(response) {
       const details = h('details', { class: 'reasoning' }, h('summary', {}, 'Thinking'));
       details.append(markdown(value.Summary.join('\n\n'), 'body'));
       append(details);
-    } else if (output.Type === 'message' && value.Text) {
+    } else if (output.Type === 'message' && value.Text?.trim()) {
       append(markdown(value.Text));
     } else if (output.Type === 'tool_call') {
       addCall(value);
@@ -484,9 +484,21 @@ function autosize() {
   input.style.height = Math.min(input.scrollHeight, window.innerHeight * 0.4) + 'px';
 }
 
+// friendlyError explains common provider failures; the raw message stays in
+// the tooltip.
+function friendlyError(message) {
+  const status = Number(message.match(/status (\d{3})/)?.[1]);
+  if (status === 429) return 'The provider is rate-limiting this model. Free models share limits, so retry in a minute or pick another model.';
+  if (status === 401 || status === 403) return 'The provider rejected the API key. Check it in Settings.';
+  if (status === 402) return 'Out of credits, or over this key\'s spending limit. Add credits on OpenRouter or raise the limit.';
+  if (status === 404 || /model.*(not found|does not exist|invalid)/i.test(message)) return 'This model is not available. Pick another one from the model menu.';
+  return message;
+}
+
 function showBanner(text, retry = false) {
   $('#banner').hidden = false;
-  $('#banner-text').textContent = text;
+  $('#banner-text').textContent = friendlyError(text);
+  $('#banner-text').title = text;
   $('#banner-retry').hidden = !retry || !S.session;
   if (!retry) $('#banner').dataset.sticky = '1';
 }
@@ -501,23 +513,18 @@ function currentProvider() {
   return S.state.providers.find(p => p.name === S.state.config.provider);
 }
 
-// The toolbar offers only providers that have a key (or were enabled), their
-// curated models, and the effort levels.
+// The toolbar offers providers that have a key (or were enabled), any model
+// from the provider's catalog, and effort levels.
 function renderToolbar() {
   const { config, providers, thinking } = S.state;
   const available = providers.filter(p => config.available.includes(p.name));
   const provider = currentProvider();
   $('#add-key').hidden = available.length > 0;
-  for (const id of ['#provider', '#model', '#thinking', '#permission', '#websearch-label']) $(id).hidden = !provider;
+  for (const id of ['#provider', '#model-picker', '#thinking', '#permission', '#websearch-label']) $(id).hidden = !provider;
   if (!provider) return;
   $('#provider').replaceChildren(...available.map(p => h('option', { value: p.name }, p.label)));
   $('#provider').value = provider.name;
   $('#provider').disabled = available.length < 2;
-  const selected = config.selected[provider.name];
-  const models = provider.models.length ? provider.models : [{ id: selected, label: selected }];
-  $('#model').replaceChildren(...models.map(m => h('option', { value: m.id, title: m.id }, m.label)));
-  $('#model').value = selected;
-  $('#model').disabled = models.length < 2;
   $('#thinking').replaceChildren(...thinking.map(level => h('option', { value: level }, `effort: ${level}`)));
   $('#thinking').value = config.thinking;
   $('#permission').value = config.permission;
@@ -528,6 +535,127 @@ function renderToolbar() {
   $('#websearch-label').title = provider.hosted_search
     ? 'Provider-hosted web search. The web-research skill works either way.'
     : `${provider.label} has no hosted search; the agent uses the web-research skill instead.`;
+  renderModelButton();
+  loadCatalog(provider);
+}
+
+// ---------- model picker ----------
+
+const catalogs = {}; // provider → { models, error } once loaded
+
+async function loadCatalog(provider) {
+  if (catalogs[provider.name]) return catalogs[provider.name];
+  catalogs[provider.name] = { models: provider.models.map(m => ({ id: m.id, name: m.label, input: -1, output: -1, reasoning: true, recommended: true })), loading: true };
+  try {
+    const result = await api('GET', `/api/models?${query({ provider: provider.name })}`);
+    catalogs[provider.name] = { models: result.models, error: result.error };
+  } catch (error) {
+    catalogs[provider.name].error = error.message;
+  }
+  catalogs[provider.name].loading = false;
+  if (currentProvider()?.name === provider.name) {
+    renderModelButton();
+    if (!$('#model-popover').hidden) renderModelOptions();
+  }
+  return catalogs[provider.name];
+}
+
+function modelInfo(provider, id) {
+  return catalogs[provider.name]?.models.find(m => m.id === id)
+    || provider.models.map(m => ({ id: m.id, name: m.label, reasoning: true })).find(m => m.id === id);
+}
+
+function renderModelButton() {
+  const provider = currentProvider();
+  if (!provider) return;
+  const id = S.state.config.selected[provider.name];
+  const info = modelInfo(provider, id);
+  const recommended = provider.models.find(m => m.id === id);
+  $('#model-label').textContent = recommended?.label || info?.name || id || 'Choose a model';
+  $('#model-button').title = id || 'Choose a model';
+  // Effort only matters for reasoning models; others ignore it.
+  const reasoning = info ? info.reasoning !== false : true;
+  $('#thinking').disabled = !reasoning;
+  $('#thinking').title = reasoning ? 'Reasoning effort' : 'This model has no reasoning effort setting';
+}
+
+function formatPrice(info) {
+  if (info.input === 0 && info.output === 0) return h('span', { class: 'free' }, 'free');
+  if (!(info.input >= 0)) return '';
+  const fmt = n => n >= 10 ? n.toFixed(0) : n >= 1 ? n.toFixed(1) : n.toFixed(2);
+  return `$${fmt(info.input)} / $${fmt(info.output)}`;
+}
+
+let modelActive = 0;
+let modelRows = [];
+
+function renderModelOptions() {
+  const provider = currentProvider();
+  const catalog = catalogs[provider.name] || { models: [] };
+  const current = S.state.config.selected[provider.name];
+  const words = $('#model-search').value.toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = m => words.every(word => `${m.id} ${m.name || ''}`.toLowerCase().includes(word));
+  const recommended = provider.models.map(r => ({ ...(catalog.models.find(m => m.id === r.id) || { id: r.id, input: -1, output: -1 }), name: r.label }));
+  const all = catalog.models.filter(matches);
+  if (words.length) {
+    // Prefer words matched at the start of a name part, so "20b" ranks
+    // gpt-oss-20b above gpt-oss-120b, then shorter IDs.
+    const starts = words.map(word => new RegExp(`(^|[^a-z0-9])${word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+    const score = m => starts.filter(re => re.test(`${m.id} ${m.name || ''}`.toLowerCase())).length;
+    all.sort((a, b) => score(b) - score(a) || a.id.length - b.id.length);
+  }
+  const sections = [];
+  if (!words.length) sections.push(['Recommended', recommended]);
+  sections.push([words.length ? `Matches · ${all.length}` : `All models · ${catalog.models.length}`, all]);
+  const typed = $('#model-search').value.trim();
+  if (typed && !catalog.models.some(m => m.id === typed) && /[\w.-]+\/[\w.:-]+|^[\w.:-]+$/.test(typed)) {
+    sections.push(['Other', [{ id: typed, name: `Use "${typed}"`, input: -1, output: -1, custom: true }]]);
+  }
+  modelRows = [];
+  const container = $('#model-options');
+  container.replaceChildren(...sections.flatMap(([title, models]) => models.length === 0 ? [] : [
+    h('div', { class: 'model-section' }, title),
+    ...models.map(m => {
+      const row = h('div', {
+        class: 'model-row' + (m.id === current ? ' current' : ''),
+        role: 'option',
+        onclick: () => chooseModel(m.id),
+        onmousemove: () => setModelActive(modelRows.indexOf(row)),
+      },
+      h('span', { class: 'model-main' }, h('span', { class: 'model-name' }, m.name || m.id), m.name && !m.custom && h('span', { class: 'model-id' }, m.id)),
+      h('span', { class: 'model-meta' }, formatPrice(m),
+        m.context ? h('span', { class: 'model-id' }, `${Math.round(m.context / 1000)}k context${m.reasoning ? ' · reasoning' : ''}`) : null));
+      modelRows.push(row);
+      return row;
+    }),
+  ]));
+  setModelActive(0);
+  $('#model-hint').textContent = catalog.loading ? 'Loading models…'
+    : catalog.error ? `Could not load the full list (${catalog.error}).`
+    : provider.name === 'openrouter' ? 'Prices are per million input / output tokens. Only models that can call tools are listed.' : '';
+}
+
+function setModelActive(index) {
+  if (!modelRows.length) return;
+  modelActive = Math.max(0, Math.min(index, modelRows.length - 1));
+  modelRows.forEach((row, i) => row.classList.toggle('active', i === modelActive));
+  modelRows[modelActive].scrollIntoView({ block: 'nearest' });
+}
+
+function openModelPicker() {
+  $('#model-popover').hidden = false;
+  $('#model-search').value = '';
+  renderModelOptions();
+  $('#model-search').focus();
+}
+
+function closeModelPicker() {
+  $('#model-popover').hidden = true;
+}
+
+function chooseModel(id) {
+  closeModelPicker();
+  saveConfig({ models: { [currentProvider().name]: id } });
 }
 
 async function saveConfig(update) {
@@ -663,9 +791,7 @@ async function openSettings(focusProvider) {
     return h('div', { class: 'provider-field' },
       h('label', {}, p.label),
       access,
-      p.models.length
-        ? h('input', { 'data-base': p.name, placeholder: p.base_url, value: config.base_urls[p.name] || '', spellcheck: 'false', title: 'Base URL override (optional)' })
-        : h('input', { 'data-model': p.name, placeholder: 'model ID', value: config.selected[p.name] || '', spellcheck: 'false', title: 'Model ID for this provider' }));
+      h('input', { 'data-base': p.name, placeholder: p.base_url, value: config.base_urls[p.name] || '', spellcheck: 'false', title: 'Base URL override (optional)' }));
   }));
   $('#instructions').value = config.instructions || '';
   $('#env').value = Object.entries(config.env).map(([name, value]) => `${name}=${value}`).join('\n');
@@ -691,16 +817,16 @@ async function saveSettings(event) {
     if (at <= 0) { settingsError(`Expected NAME=value: ${trimmed}`); return; }
     env[trimmed.slice(0, at).trim()] = trimmed.slice(at + 1).trim();
   }
-  const apiKeys = {}, baseURLs = {}, models = {}, enabled = {};
+  const apiKeys = {}, baseURLs = {}, enabled = {};
   for (const input of document.querySelectorAll('[data-key]')) if (input.value.trim()) apiKeys[input.dataset.key] = input.value.trim();
   for (const input of document.querySelectorAll('[data-base]')) baseURLs[input.dataset.base] = input.value.trim();
-  for (const input of document.querySelectorAll('[data-model]')) models[input.dataset.model] = input.value.trim();
   for (const input of document.querySelectorAll('[data-enable]')) enabled[input.dataset.enable] = input.checked;
   try {
     S.state.config = await api('PUT', '/api/config', {
-      api_keys: apiKeys, base_urls: baseURLs, models, enabled, env, instructions: $('#instructions').value,
+      api_keys: apiKeys, base_urls: baseURLs, enabled, env, instructions: $('#instructions').value,
     });
     $('#settings').close();
+    for (const name of Object.keys(catalogs)) delete catalogs[name]; // keys may have changed
     renderToolbar();
     refreshGitHub();
   } catch (error) { settingsError(error.message); }
@@ -777,7 +903,17 @@ function wire() {
   $('#provider').addEventListener('change', event => saveConfig({ provider: event.target.value }));
   $('#thinking').addEventListener('change', event => saveConfig({ thinking: event.target.value }));
   $('#websearch').addEventListener('change', event => saveConfig({ web_search: event.target.checked }));
-  $('#model').addEventListener('change', event => saveConfig({ models: { [currentProvider().name]: event.target.value } }));
+  $('#model-button').addEventListener('click', () => $('#model-popover').hidden ? openModelPicker() : closeModelPicker());
+  $('#model-search').addEventListener('input', renderModelOptions);
+  $('#model-search').addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown') { event.preventDefault(); setModelActive(modelActive + 1); }
+    else if (event.key === 'ArrowUp') { event.preventDefault(); setModelActive(modelActive - 1); }
+    else if (event.key === 'Enter') { event.preventDefault(); modelRows[modelActive]?.click(); }
+    else if (event.key === 'Escape') { event.stopPropagation(); closeModelPicker(); $('#model-button').focus(); }
+  });
+  document.addEventListener('mousedown', event => {
+    if (!$('#model-popover').hidden && !event.target.closest('#model-picker')) closeModelPicker();
+  });
   $('#permission').addEventListener('change', event => saveConfig({ permission: event.target.value }));
   $('#add-key').addEventListener('click', () => openSettings('openrouter'));
   $('#approve-all').addEventListener('click', () => approve_('', true));

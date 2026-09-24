@@ -28,7 +28,14 @@
       <div id="title" class="grow"><span id="title-text"></span><span id="title-ws" class="muted small"></span></div>
       <button id="add-key" class="primary" hidden>Add an API key</button>
       <select id="provider" title="Model provider (only providers with a key appear)"></select>
-      <select id="model" title="Model"></select>
+      <div id="model-picker">
+        <button id="model-button" type="button" title="Model"><span id="model-label"></span> ▾</button>
+        <div id="model-popover" hidden>
+          <input id="model-search" placeholder="Search models" spellcheck="false" autocomplete="off">
+          <div id="model-options" role="listbox"></div>
+          <div id="model-hint" class="muted small"></div>
+        </div>
+      </div>
       <select id="thinking" title="Reasoning effort"></select>
       <select id="permission" title="What the agent may do without asking">
         <option value="ask">Ask first</option>

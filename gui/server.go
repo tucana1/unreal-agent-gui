@@ -51,6 +51,7 @@ func (app *App) handler() http.Handler {
 	}))
 	mux.HandleFunc("GET /api/state", app.handleState)
 	mux.HandleFunc("PUT /api/config", app.handleConfig)
+	mux.HandleFunc("GET /api/models", app.handleModels)
 	mux.HandleFunc("GET /api/github", app.handleGitHub)
 	mux.HandleFunc("POST /api/pick-folder", app.handlePickFolder)
 	mux.HandleFunc("DELETE /api/sessions/{id}", app.handleDelete)
@@ -164,6 +165,20 @@ func (app *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		app.approveAll()
 	}
 	writeJSON(w, http.StatusOK, cfg.view())
+}
+
+func (app *App) handleModels(w http.ResponseWriter, r *http.Request) {
+	p, ok := providerNamed(r.URL.Query().Get("provider"))
+	if !ok {
+		writeError(w, http.StatusBadRequest, errors.New("unknown provider"))
+		return
+	}
+	models, err := p.models(r.Context(), app.config())
+	response := map[string]any{"models": models}
+	if err != nil {
+		response["error"] = err.Error() // the recommended picks still work
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 var ghAccount = regexp.MustCompile(`Logged in to (\S+) account (\S+)`)

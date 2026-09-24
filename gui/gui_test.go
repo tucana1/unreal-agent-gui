@@ -215,9 +215,9 @@ func TestProviderAvailability(t *testing.T) {
 	if got := p.model(cfg); got != p.Models[0].ID || !strings.HasSuffix(got, ":free") {
 		t.Fatalf("default model = %q, want the free option", got)
 	}
-	cfg.Models = map[string]string{"openrouter": "some/unlisted-model"}
-	if got := p.model(cfg); got != p.Models[0].ID {
-		t.Fatalf("unlisted model %q was accepted", got)
+	cfg.Models = map[string]string{"openrouter": "some/other-model"}
+	if got := p.model(cfg); got != "some/other-model" {
+		t.Fatalf("chosen model = %q", got)
 	}
 	codex, _ := providerNamed("openai-codex")
 	if codex.available(cfg) {
@@ -229,8 +229,38 @@ func TestProviderAvailability(t *testing.T) {
 	}
 	ollama, _ := providerNamed("ollama")
 	cfg.Enabled["ollama"] = true
-	if ollama.available(cfg) {
-		t.Fatal("Ollama is available without a model ID")
+	if !ollama.available(cfg) || ollama.model(cfg) != "" {
+		t.Fatal("enabled Ollama should be available with no model chosen yet")
+	}
+}
+
+func TestModelCatalog(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(`{"data":[
+			{"id":"b/chat","name":"B","context_length":131072,"pricing":{"prompt":"0.0000001","completion":"0.0000005"},"supported_parameters":["tools","reasoning"]},
+			{"id":"a/free:free","name":"A","pricing":{"prompt":"0","completion":"0"},"supported_parameters":["tools"]},
+			{"id":"c/no-tools","pricing":{"prompt":"0","completion":"0"},"supported_parameters":["temperature"]},
+			{"id":"b/chat:batch","supported_parameters":["tools"]}
+		]}`))
+	}))
+	defer server.Close()
+	p := provider{Name: "test-catalog", Label: "Test", BaseURL: server.URL, Catalog: true, Models: []modelOption{{ID: "a/free:free"}}}
+	models, err := p.models(t.Context(), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 2 || models[0].ID != "a/free:free" || models[1].ID != "b/chat" {
+		t.Fatalf("models = %+v", models)
+	}
+	if !models[0].Recommends || models[0].Input != 0 || models[0].Reasoning {
+		t.Errorf("free model = %+v", models[0])
+	}
+	if models[1].Input != 0.1 || models[1].Output != 0.5 || !models[1].Reasoning || models[1].Context != 131072 {
+		t.Errorf("paid model = %+v", models[1])
 	}
 }
 

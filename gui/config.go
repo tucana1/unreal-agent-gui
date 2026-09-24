@@ -1,15 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/fireworks"
@@ -68,10 +75,12 @@ type provider struct {
 	Label   string `json:"label"`
 	BaseURL string `json:"base_url"`
 	KeyEnv  string `json:"key_env"`
-	// Models are the choices offered in the toolbar, cheapest first. Providers
-	// without a curated list take a model ID in Settings.
-	Models       []modelOption `json:"models"`
-	HostedSearch bool          `json:"hosted_search"`
+	// Models are recommended picks, cheapest first; the first is the default.
+	Models []modelOption `json:"models"`
+	// Catalog means the provider lists its models at GET <base URL>/models,
+	// so the toolbar can offer any of them.
+	Catalog      bool `json:"catalog"`
+	HostedSearch bool `json:"hosted_search"`
 	newClient    func(key, baseURL string) (client, error)
 }
 
@@ -86,7 +95,7 @@ type modelOption struct {
 var providers = []provider{
 	{
 		Name: "openrouter", Label: "OpenRouter", BaseURL: "https://openrouter.ai/api/v1",
-		KeyEnv: "OPENROUTER_API_KEY",
+		KeyEnv: "OPENROUTER_API_KEY", Catalog: true,
 		Models: []modelOption{
 			{ID: "nvidia/nemotron-3-super-120b-a12b:free", Label: "Nemotron 3 Super · free"},
 			{ID: "openai/gpt-6-astra", Label: "GPT-6 Astra · best"},
@@ -97,7 +106,7 @@ var providers = []provider{
 	},
 	{
 		Name: "openai", Label: "OpenAI", BaseURL: "https://api.openai.com/v1",
-		KeyEnv: "OPENAI_API_KEY", HostedSearch: true,
+		KeyEnv: "OPENAI_API_KEY", HostedSearch: true, Catalog: true,
 		Models: []modelOption{
 			{ID: "gpt-6-luna", Label: "GPT-6 Luna · cheaper"},
 			{ID: "gpt-6-astra", Label: "GPT-6 Astra · best"},
@@ -123,13 +132,13 @@ var providers = []provider{
 	},
 	{
 		Name: "fireworks", Label: "Fireworks", BaseURL: "https://api.fireworks.ai/inference/v1",
-		KeyEnv: "FIREWORKS_API_KEY",
+		KeyEnv: "FIREWORKS_API_KEY", Catalog: true,
 		newClient: func(key, baseURL string) (client, error) {
 			return fireworks.NewClient(fireworks.Config{APIKey: key, BaseURL: baseURL})
 		},
 	},
 	{
-		Name: "ollama", Label: "Ollama (local)", BaseURL: ollama.BaseURL,
+		Name: "ollama", Label: "Ollama (local)", BaseURL: ollama.BaseURL, Catalog: true,
 		newClient: func(_, baseURL string) (client, error) {
 			return ollama.NewClient(ollama.Config{BaseURL: baseURL})
 		},
@@ -161,30 +170,24 @@ func (p provider) apiKey(cfg Config) string {
 	return ""
 }
 
-// model is the selected model: one of the curated options (the cheapest by
-// default), or the ID typed in Settings for providers without a list.
+// model is the chosen model ID, or the first recommended pick.
 func (p provider) model(cfg Config) string {
-	chosen := strings.TrimSpace(cfg.Models[p.Name])
-	if len(p.Models) == 0 {
+	if chosen := strings.TrimSpace(cfg.Models[p.Name]); chosen != "" {
 		return chosen
 	}
-	if slices.ContainsFunc(p.Models, func(m modelOption) bool { return m.ID == chosen }) {
-		return chosen
+	if len(p.Models) > 0 {
+		return p.Models[0].ID
 	}
-	return p.Models[0].ID
+	return ""
 }
 
 // available reports whether the provider can be selected: it has a key, or
-// the user enabled a keyless provider, and it has a model.
+// the user enabled a keyless provider.
 func (p provider) available(cfg Config) bool {
 	if p.KeyEnv != "" {
-		if p.apiKey(cfg) == "" {
-			return false
-		}
-	} else if !cfg.Enabled[p.Name] {
-		return false
+		return p.apiKey(cfg) != ""
 	}
-	return p.model(cfg) != ""
+	return cfg.Enabled[p.Name]
 }
 
 // selectedProvider is the configured provider if available, otherwise the
@@ -211,6 +214,130 @@ func (p provider) connect(cfg Config) (client, error) {
 		return nil, fmt.Errorf("connect to %s: %w", p.Label, err)
 	}
 	return c, nil
+}
+
+// modelInfo describes one model in a provider's catalog. Prices are USD per
+// million tokens; -1 means unknown (plain /models lists carry no metadata).
+type modelInfo struct {
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	Input      float64 `json:"input"`
+	Output     float64 `json:"output"`
+	Context    int     `json:"context"`
+	Reasoning  bool    `json:"reasoning"`
+	Recommends bool    `json:"recommended"`
+}
+
+type catalogEntry struct {
+	models  []modelInfo
+	fetched time.Time
+}
+
+var (
+	catalogMu    sync.Mutex
+	catalogCache = map[string]catalogEntry{}
+)
+
+const catalogTTL = 30 * time.Minute
+
+// models returns the provider's catalog, limited to models that can call
+// tools, which the agent needs. Results are cached briefly.
+func (p provider) models(ctx context.Context, cfg Config) ([]modelInfo, error) {
+	if !p.Catalog {
+		return p.recommended(), nil
+	}
+	catalogMu.Lock()
+	cached, ok := catalogCache[p.Name]
+	catalogMu.Unlock()
+	if ok && time.Since(cached.fetched) < catalogTTL {
+		return cached.models, nil
+	}
+	models, err := p.fetchModels(ctx, cfg)
+	if err != nil {
+		return p.recommended(), err
+	}
+	catalogMu.Lock()
+	catalogCache[p.Name] = catalogEntry{models: models, fetched: time.Now()}
+	catalogMu.Unlock()
+	return models, nil
+}
+
+func (p provider) recommended() []modelInfo {
+	models := make([]modelInfo, 0, len(p.Models))
+	for _, option := range p.Models {
+		models = append(models, modelInfo{ID: option.ID, Name: option.Label, Input: -1, Output: -1, Reasoning: true, Recommends: true})
+	}
+	return models
+}
+
+func (p provider) fetchModels(ctx context.Context, cfg Config) ([]modelInfo, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(p.baseURL(cfg), "/")+"/models", nil)
+	if err != nil {
+		return nil, err
+	}
+	if key := p.apiKey(cfg); key != "" {
+		request.Header.Set("Authorization", "Bearer "+key)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return nil, fmt.Errorf("list %s models: %w", p.Label, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list %s models: HTTP %d", p.Label, response.StatusCode)
+	}
+	var body struct {
+		Data []struct {
+			ID      string `json:"id"`
+			Name    string `json:"name"`
+			Context int    `json:"context_length"`
+			Pricing *struct {
+				Prompt     string `json:"prompt"`
+				Completion string `json:"completion"`
+			} `json:"pricing"`
+			Parameters []string `json:"supported_parameters"`
+		} `json:"data"`
+	}
+	if err := json.UnmarshalRead(io.LimitReader(response.Body, 32<<20), &body); err != nil {
+		return nil, fmt.Errorf("decode %s models: %w", p.Label, err)
+	}
+	recommended := map[string]bool{}
+	for _, option := range p.Models {
+		recommended[option.ID] = true
+	}
+	models := make([]modelInfo, 0, len(body.Data))
+	for _, entry := range body.Data {
+		if entry.ID == "" || strings.HasSuffix(entry.ID, ":batch") {
+			continue
+		}
+		info := modelInfo{ID: entry.ID, Name: entry.Name, Input: -1, Output: -1, Context: entry.Context, Recommends: recommended[entry.ID]}
+		if entry.Parameters != nil {
+			// Rich catalogs (OpenRouter) say which models can call tools.
+			if !slices.Contains(entry.Parameters, "tools") {
+				continue
+			}
+			info.Reasoning = slices.Contains(entry.Parameters, "reasoning")
+		} else {
+			info.Reasoning = true // unknown; the effort setting is harmless if ignored
+		}
+		if entry.Pricing != nil {
+			info.Input, info.Output = perMillion(entry.Pricing.Prompt), perMillion(entry.Pricing.Completion)
+		}
+		models = append(models, info)
+	}
+	slices.SortFunc(models, func(a, b modelInfo) int { return strings.Compare(a.ID, b.ID) })
+	return models, nil
+}
+
+// perMillion converts a per-token price string to USD per million tokens.
+func perMillion(price string) float64 {
+	value, err := strconv.ParseFloat(price, 64)
+	if err != nil || value < 0 {
+		return -1
+	}
+	return math.Round(value*1e12) / 1e6 // six decimals, without float noise
 }
 
 func defaultConfig() Config {
